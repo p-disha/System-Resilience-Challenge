@@ -6,18 +6,194 @@ At-least-once webhook delivery engine for a Fintech platform.
 
 ---
 
-## Quick Start
+## Prerequisites
+
+| Tool | Version | Check |
+|---|---|---|
+| Docker Desktop | ≥ 24 | `docker --version` |
+| Docker Compose | ≥ 2.20 (bundled with Docker Desktop) | `docker compose version` |
+| curl | any | `curl --version` |
+| bash | any (Git Bash on Windows) | `bash --version` |
+
+No Python installation needed — everything runs inside containers.
+
+---
+
+## Getting Started
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/p-disha/System-Resilience-Challenge.git
+cd System-Resilience-Challenge
+```
+
+### 2. Create your environment file
 
 ```bash
 cp .env.example .env
+```
+
+The defaults in `.env.example` work out of the box for local development.
+For production, replace `WEBHOOK_SECRET` with a cryptographically random value:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 3. Start the stack
+
+```bash
 docker-compose up --build
 ```
 
-| Service | Port | Description |
+This builds both images and starts all three services. Wait for:
+
+```
+dispatcher-1  | {"message": "=== Ready — 3 worker(s) running ==="}
+```
+
+> On subsequent runs (no code changes) use `docker-compose up` — skips the rebuild.
+
+### 4. Verify everything is healthy
+
+```bash
+# Dispatcher API + database
+curl http://localhost:8000/health
+# → {"status":"ok"}
+
+# Mock receiver
+curl http://localhost:5001/health
+# → {"status":"ok","mode":"demo"}
+```
+
+### 5. Send your first webhook
+
+```bash
+curl -X POST http://localhost:8000/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_type": "payment.captured",
+    "payload": {"transaction_id": "TXN-001", "amount": 149.99},
+    "idempotency_key": "txn-001"
+  }'
+# → {"job_id":"...","status":"pending","message":"Enqueued for delivery to ..."}
+```
+
+### 6. Watch delivery in real time
+
+```bash
+# See the backoff sequence as it happens
+docker-compose logs -f dispatcher
+
+# See the mock receiver accepting/rejecting
+docker-compose logs -f mock-receiver
+```
+
+### 7. Run the automated backoff demo
+
+```bash
+# In a second terminal (stack must already be running)
+bash demo.sh
+```
+
+Expected output — 5 forced failures then delivery:
+```
+10:37:55 [demo]  Sending POST /events ...
+10:37:55 [✓]    Event enqueued. Job ID: 48ffb20e-...
+10:37:55 [!]    Attempt 1/10 FAILED | next_retry=10:37:57 | error: HTTP 500: forced_fail 1/5
+10:37:57 [!]    Attempt 2/10 FAILED | next_retry=10:38:01 | error: HTTP 500: forced_fail 2/5
+10:38:03 [!]    Attempt 3/10 FAILED | next_retry=10:38:12 | error: HTTP 500: forced_fail 3/5
+10:38:13 [!]    Attempt 4/10 FAILED | next_retry=10:38:26 | error: HTTP 500: forced_fail 4/5
+10:38:27 [!]    Attempt 5/10 FAILED | next_retry=10:38:55 | error: HTTP 500: forced_fail 5/5
+10:38:56 [✓]    DELIVERED on attempt 6/10
+```
+
+### 8. Stop and clean up
+
+```bash
+# Stop containers, keep database volume (jobs survive)
+docker-compose down
+
+# Stop containers AND wipe database volume (full reset)
+docker-compose down -v
+```
+
+---
+
+## Services
+
+| Service | Local port | Description |
 |---|---|---|
-| dispatcher | 8000 | FastAPI ingestion API + background delivery workers |
-| mock-receiver | 5001 | Chaotic endpoint — 70% failure rate |
-| postgres | 5432 | Persistent job queue (survives restarts) |
+| dispatcher | 8000 | FastAPI ingestion API + 3 background delivery workers |
+| mock-receiver | 5001 | Chaotic endpoint — 5 forced failures then success (default) |
+| postgres | 5432 | Persistent job queue (survives `docker-compose down`) |
+
+---
+
+## Mock Receiver Modes
+
+Switch modes by editing `.env` before `docker-compose up`:
+
+```bash
+# Demo mode (default) — deterministic: exactly 5 failures then always succeed
+FORCE_FAIL_COUNT=5
+
+# Chaos mode — random: 40% HTTP 500, 20% connection drop, 10% HTTP 503, 30% success
+FORCE_FAIL_COUNT=0
+```
+
+Reset the mock receiver's per-event counters without restarting:
+
+```bash
+curl -X POST http://localhost:5001/reset
+```
+
+---
+
+## Inspecting the Queue Directly
+
+```bash
+# Connect to PostgreSQL
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U dispatcher -d webhooks
+
+# All jobs and their current status
+SELECT id, event_type, status, attempt_count, next_attempt_at, last_error
+FROM webhook_jobs ORDER BY created_at DESC;
+
+# Count by status
+SELECT status, COUNT(*) FROM webhook_jobs GROUP BY status;
+
+# Jobs waiting to retry
+SELECT id, event_type, attempt_count, next_attempt_at
+FROM webhook_jobs WHERE status = 'pending' ORDER BY next_attempt_at;
+```
+
+---
+
+## Crash Recovery Demo
+
+```bash
+# 1. Enqueue a job
+curl -X POST http://localhost:8000/events \
+  -H "Content-Type: application/json" \
+  -d '{"event_type": "payment.captured", "payload": {"txn": "TXN-CRASH-TEST"}}'
+
+# 2. Kill the dispatcher while it is waiting between retries
+docker-compose kill dispatcher
+
+# 3. Confirm the job is still in PostgreSQL (not lost)
+docker exec $(docker-compose ps -q postgres) \
+  psql -U dispatcher -d webhooks \
+  -c "SELECT id, status, attempt_count, next_attempt_at FROM webhook_jobs;"
+
+# 4. Restart — dispatcher resets any 'processing' jobs back to 'pending' on startup
+docker-compose start dispatcher
+
+# 5. Watch it resume delivery from where it left off
+docker-compose logs -f dispatcher
+```
 
 ---
 
@@ -88,72 +264,6 @@ curl http://localhost:8000/metrics
 ```
 
 Exposes counters (`jobs_enqueued_total`, `jobs_delivered_total`, `jobs_failed_total`, `jobs_retried_total`, `jobs_replayed_total`), histograms (`delivery_duration_seconds`), gauges (`queue_depth_pending`, `queue_depth_processing`), and circuit-breaker counters.
-
----
-
-## Running the Backoff Demo
-
-The demo script sends one event and polls until it's delivered, printing each failed attempt and its retry delay:
-
-```bash
-# Terminal 1 — start services
-docker-compose up --build
-
-# Terminal 2 — run demo (FORCE_FAIL_COUNT=5 means exactly 5 failures then success)
-bash demo.sh
-```
-
-Expected output:
-```
-12:00:00 [demo]  Sending POST /events ...
-12:00:00 [✓]    Event enqueued. Job ID: abc-123
-12:00:02 [!]    Attempt 1/10 FAILED | next_retry=12:00:04 | error: HTTP 500: Forced failure 1/5
-12:00:04 [!]    Attempt 2/10 FAILED | next_retry=12:00:08 | error: HTTP 500: Forced failure 2/5
-12:00:08 [!]    Attempt 3/10 FAILED | next_retry=12:00:16 | error: HTTP 500: Forced failure 3/5
-12:00:16 [!]    Attempt 4/10 FAILED | next_retry=12:00:32 | error: HTTP 500: Forced failure 4/5
-12:00:32 [!]    Attempt 5/10 FAILED | next_retry=12:01:04 | error: HTTP 500: Forced failure 5/5
-12:01:04 [✓]    DELIVERED on attempt 6/10
-```
-
-**Watch the full backoff sequence in the dispatcher logs:**
-```bash
-docker-compose logs -f dispatcher
-docker-compose logs -f mock-receiver
-```
-
-### Mock receiver behaviour
-
-| Mode | Configuration | Behaviour |
-|---|---|---|
-| Demo (default) | `FORCE_FAIL_COUNT=5` | First 5 attempts per event always fail with 500, then always succeed |
-| Chaos | `FORCE_FAIL_COUNT=0` | 40% HTTP 500, 20% connection drop, 10% HTTP 503, 30% success |
-
----
-
-## Crash Recovery Demo
-
-Proves that no message is lost when the process is killed mid-retry:
-
-```bash
-# 1. Enqueue a job
-curl -X POST http://localhost:8000/events \
-  -H "Content-Type: application/json" \
-  -d '{"event_type": "payment.captured", "payload": {"txn": "TXN-999"}}'
-
-# 2. Kill the dispatcher while it's waiting to retry
-docker-compose kill dispatcher
-
-# 3. The job is still in PostgreSQL (volume persists)
-docker exec $(docker-compose ps -q postgres) \
-  psql -U dispatcher -d webhooks \
-  -c "SELECT id, status, attempt_count, next_attempt_at FROM webhook_jobs;"
-
-# 4. Restart — dispatcher resets 'processing' → 'pending' on startup
-docker-compose start dispatcher
-
-# 5. Watch it resume
-docker-compose logs -f dispatcher
-```
 
 ---
 
