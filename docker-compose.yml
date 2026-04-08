@@ -1,0 +1,116 @@
+version: "3.9"
+
+# SECURITY NOTE: Replace WEBHOOK_SECRET with a cryptographically random value
+# before any production deployment:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+#
+# The default below is intentionally long (≥32 chars) to pass the config
+# validator, but it is publicly known from this source file. Any deployment
+# that uses this default has effectively no webhook authentication.
+
+services:
+
+  # ── PostgreSQL — the persistent job queue ──────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-webhooks}
+      POSTGRES_USER: ${POSTGRES_USER:-dispatcher}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dispatcher} -d ${POSTGRES_DB:-webhooks}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Mock Receiver — chaotic merchant endpoint ──────────────────────────────
+  mock-receiver:
+    build:
+      context: ./mock-receiver
+    ports:
+      - "5001:5000"
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-super-secret-webhook-key-change-in-prod-use-secrets-token-hex}
+      # FORCE_FAIL_COUNT=5: deterministic demo — first 5 attempts always fail, then succeed.
+      # Set to 0 for random 70% chaos mode.
+      FORCE_FAIL_COUNT: ${FORCE_FAIL_COUNT:-5}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Dispatcher — FastAPI API + background delivery workers ─────────────────
+  dispatcher:
+    build:
+      context: ./dispatcher
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
+    ports:
+      - "8000:8000"
+    environment:
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-dispatcher}:${POSTGRES_PASSWORD:-secret}@postgres:5432/${POSTGRES_DB:-webhooks}
+
+      # Signing — must match mock-receiver
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-super-secret-webhook-key-change-in-prod-use-secrets-token-hex}
+
+      # Delivery target
+      TARGET_URL: http://mock-receiver:5000/webhook
+
+      # SECURITY: True here because mock-receiver is an internal Docker hostname.
+      # Set to False in production — blocks target_url that resolves to private IPs (SSRF).
+      ALLOW_PRIVATE_TARGETS: "true"
+
+      # CORS: empty = disabled (backend API, no browser callers).
+      # Set CORS_ORIGINS="*" or "https://yourdomain.com" if a web UI calls this API.
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+
+      # Worker tuning
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-3}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-2}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-10}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-10}
+
+      # Request size limit (bytes): reject payloads larger than this
+      MAX_PAYLOAD_BYTES: ${MAX_PAYLOAD_BYTES:-1048576}
+
+      # Exponential backoff
+      BASE_DELAY_SECONDS: ${BASE_DELAY_SECONDS:-2}
+      MAX_DELAY_SECONDS: ${MAX_DELAY_SECONDS:-3600}
+      JITTER_FACTOR: ${JITTER_FACTOR:-0.20}
+
+      # Watchdog: reset jobs stuck in 'processing' for longer than this (seconds)
+      PROCESSING_JOB_TIMEOUT_SECONDS: ${PROCESSING_JOB_TIMEOUT_SECONDS:-300}
+
+      # Idempotency key TTL (hours)
+      IDEMPOTENCY_TTL_HOURS: ${IDEMPOTENCY_TTL_HOURS:-24}
+
+      # Circuit breaker
+      CIRCUIT_BREAKER_THRESHOLD: ${CIRCUIT_BREAKER_THRESHOLD:-10}
+      CIRCUIT_BREAKER_WINDOW_SECONDS: ${CIRCUIT_BREAKER_WINDOW_SECONDS:-60}
+      CIRCUIT_BREAKER_RECOVERY_SECONDS: ${CIRCUIT_BREAKER_RECOVERY_SECONDS:-300}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-receiver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    # Named volume: survives 'docker-compose down' (but NOT 'docker-compose down -v').
+    # This durability is what makes the at-least-once guarantee hold across restarts.
